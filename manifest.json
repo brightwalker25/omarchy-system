@@ -1,0 +1,91 @@
+{
+  "schemaVersion": 1,
+  "id": "brightwalker25.system",
+  "name": "System",
+  "version": "0.2.1",
+  "author": "brightwalker25",
+  "license": "MIT",
+  "description": "Read-only system panel: thermals, load, storage, network and power",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "System",
+    "description": "Temperatures, fans, CPU, memory, disk space, network throughput and power, behind one bar glyph tinted green, amber or red",
+    "category": "System",
+    "aliases": [
+      "system",
+      "sensors",
+      "monitor",
+      "temperature",
+      "load",
+      "disk",
+      "storage",
+      "space"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalMs": 2000,
+      "perCoreCutoff": 8,
+      "maxSensorRows": 4,
+      "maxFilesystemRows": 4,
+      "diskAlarmPercent": 90
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalMs",
+        "type": "integer",
+        "label": "Refresh interval (ms)",
+        "min": 500,
+        "max": 10000,
+        "step": 500,
+        "defaultValue": 2000,
+        "description": "How often the collector runs while the panel is open. While it is closed it runs once a minute for the bar colour."
+      },
+      {
+        "key": "perCoreCutoff",
+        "type": "integer",
+        "label": "Per-core bars up to N threads",
+        "min": 0,
+        "max": 64,
+        "step": 1,
+        "defaultValue": 8,
+        "description": "Above this thread count the per-core bars are replaced by a compact strip."
+      },
+      {
+        "key": "maxSensorRows",
+        "type": "integer",
+        "label": "Temperature rows before summarising",
+        "min": 3,
+        "max": 40,
+        "step": 1,
+        "defaultValue": 4
+      },
+      {
+        "key": "maxFilesystemRows",
+        "type": "integer",
+        "label": "Filesystem rows before summarising",
+        "min": 1,
+        "max": 20,
+        "step": 1,
+        "defaultValue": 4,
+        "description": "Root first, then the fullest. The rest are summarised in one line."
+      },
+      {
+        "key": "diskAlarmPercent",
+        "type": "integer",
+        "label": "Colour a filesystem urgent at (%)",
+        "min": 50,
+        "max": 99,
+        "step": 1,
+        "defaultValue": 90,
+        "description": "How full a filesystem has to be before its bar takes the urgent colour."
+      }
+    ]
+  }
+}

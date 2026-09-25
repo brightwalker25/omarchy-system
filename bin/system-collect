@@ -1,0 +1,676 @@
+#!/usr/bin/env python3
+"""Emit one normalised snapshot of system state as JSON, for the
+brightwalker25.system bar panel.
+
+Design notes:
+
+- Stateless and instantaneous. Cumulative counters (network bytes, /proc/stat
+  jiffies) are emitted raw alongside a monotonic timestamp; the consumer takes
+  deltas between polls to get rates. Nothing here sleeps, so a poll costs one
+  pass over sysfs and no subprocesses.
+- Everything is discovered, never hardcoded. Sensor labels differ completely
+  between machines ("TPCD" on an Apple SMC, "Package id 0" on a modern Intel),
+  so nothing in this file names a specific sensor.
+- Labels come from sysfs *_label files, so lm_sensors is not a dependency.
+
+Temperatures split into two classes, because the hardware is not consistent:
+  governed - publishes a crit threshold, so headroom is a real number
+  ambient  - no threshold published (every applesmc thermistor), so the raw
+             reading is all that can be honestly shown
+"""
+import glob, json, os, re, socket, stat, sys, time
+
+HWMON = "/sys/class/hwmon"
+
+# Thresholds above this are not real. NVMe reports an unset temperature
+# threshold as 0xFFFF Kelvin, which the driver converts and publishes as
+# 65261850 (65261.85 C); treating that as a limit puts nonsense on the panel.
+MAX_PLAUSIBLE_MILLI_C = 200_000
+
+# Fans some other driver owns. These publish no hwmon reading because the
+# speed is reached over an ioctl or a procfs file instead, so an empty fan
+# list on such a machine means "not ours to read", not "no fan". Only the
+# existence of the node is tested; none of them is opened.
+VENDOR_FAN_INTERFACES = (
+    "/dev/tuxedo_io",      # tuxedo_io, on Clevo-based TUXEDO laptops
+    "/proc/acpi/ibm/fan",  # thinkpad_acpi
+)
+
+
+def read(path, default=None):
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return default
+
+
+def read_threshold(path):
+    """A temperature limit, or None if the hardware did not really publish one."""
+    v = read_int(path)
+    if v is None or v <= 0 or v > MAX_PLAUSIBLE_MILLI_C:
+        return None
+    return v
+
+
+def read_int(path):
+    v = read(path)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def sensor_dirs(hwmon):
+    """Where a chip's attributes actually live.
+
+    Drivers registered through the older hwmon API expose their attributes on
+    the parent platform device rather than in the hwmon directory itself --
+    applesmc is one, and its hwmon dir holds no name and no temp files at all.
+    Check both, or those machines look sensorless.
+    """
+    dirs = [hwmon]
+    device = os.path.join(hwmon, "device")
+    if os.path.isdir(device):
+        dirs.append(os.path.realpath(device))
+    return dirs
+
+
+def chip_name(hwmon, dirs):
+    for d in dirs:
+        name = read(os.path.join(d, "name"))
+        if name:
+            return name
+    # No name anywhere: fall back to the device directory ("applesmc.768"),
+    # trimmed of its address suffix.
+    real = os.path.realpath(os.path.join(hwmon, "device"))
+    return os.path.basename(real).split(".")[0] or os.path.basename(hwmon)
+
+
+def chip_instance(hwmon):
+    """A stable token telling two chips of the same name apart.
+
+    A machine with two NVMe drives registers two hwmon chips both named
+    "nvme", so "nvme/temp1" names a sensor on each of them. The device the
+    chip hangs off does distinguish them ("nvme0", "nvme1"), and unlike the
+    hwmon number it does not depend on probe order, so it survives a reboot.
+    """
+    real = os.path.realpath(os.path.join(hwmon, "device"))
+    return os.path.basename(real) if os.path.exists(real) else os.path.basename(hwmon)
+
+
+def duplicated_chip_names(entries):
+    """Chip names that more than one hwmon entry claims on this machine.
+
+    Only these need disambiguating. Everywhere else the id stays "chip/key",
+    so ids already recorded elsewhere do not move.
+    """
+    counts = {}
+    for hwmon in entries:
+        name = chip_name(hwmon, sensor_dirs(hwmon))
+        counts[name] = counts.get(name, 0) + 1
+    return {name for name, n in counts.items() if n > 1}
+
+
+def fan_reporting(fans):
+    """Why the fan list looks the way it does.
+
+    An empty list means two different things and the difference matters to
+    anyone reading the panel. A fanless laptop has no fan at all. A
+    laptop whose temperature-controlled fan is owned by a vendor driver over
+    an ioctl has one that no hwmon publishes, so calling that machine fanless
+    is simply wrong.
+
+    Nothing here names a machine. It reports which evidence was found, in
+    descending order of how directly it answers the question, and leaves the
+    wording to the panel:
+
+      reported - a readable rpm, so fans[] has it
+      declared - firmware says there is a fan (an ACPI fan device, or a
+                 cooling device the thermal layer drives as one), but
+                 nothing publishes a speed
+      vendor   - a driver known to own fans out of band is loaded
+      none     - no fan, and nothing claiming otherwise
+    """
+    if fans:
+        return "reported"
+
+    if glob.glob("/sys/bus/acpi/devices/PNP0C0B:*"):
+        return "declared"
+    for path in glob.glob("/sys/class/thermal/cooling_device*/type"):
+        if (read(path) or "").strip().lower() == "fan":
+            return "declared"
+
+    if any(os.path.exists(node) for node in VENDOR_FAN_INTERFACES):
+        return "vendor"
+
+    return "none"
+
+
+def collect_sensors():
+    governed, ambient, fans = [], [], []
+
+    entries = [os.path.join(HWMON, e)
+               for e in (sorted(os.listdir(HWMON)) if os.path.isdir(HWMON) else [])]
+    ambiguous = duplicated_chip_names(entries)
+
+    for hwmon in entries:
+        dirs = sensor_dirs(hwmon)
+        chip = chip_name(hwmon, dirs)
+        # Only qualify the id where the chip name alone is not unique, so the
+        # single-drive machines keep the ids their committed dumps record.
+        instance = chip_instance(hwmon) if chip in ambiguous else None
+        prefix = "%s/%s" % (chip, instance) if instance else chip
+
+        seen = set()
+        for d in dirs:
+            try:
+                files = os.listdir(d)
+            except OSError:
+                continue
+
+            for f in sorted(files):
+                if f.startswith("temp") and f.endswith("_input"):
+                    key = f[:-6]
+                    if (chip, key) in seen:
+                        continue
+                    raw = read_int(os.path.join(d, f))
+                    if raw is None:
+                        continue
+                    seen.add((chip, key))
+
+                    crit = read_threshold(os.path.join(d, key + "_crit"))
+                    hi = read_threshold(os.path.join(d, key + "_max"))
+                    rec = {
+                        "id": "%s/%s" % (prefix, key),
+                        "chip": chip,
+                        "label": read(os.path.join(d, key + "_label")) or key,
+                        "celsius": round(raw / 1000.0, 1),
+                    }
+                    # Present only where the chip name repeats, so a panel can
+                    # say which of two identically named chips this row is.
+                    if instance:
+                        rec["instance"] = instance
+                    if crit:
+                        rec["critC"] = round(crit / 1000.0, 1)
+                        # Degrees still in hand, and how much of the budget is
+                        # spent. The fraction is named for what it measures --
+                        # an earlier "headroom" held raw/crit, which is the
+                        # opposite of what the word means.
+                        rec["headroomC"] = round((crit - raw) / 1000.0, 1)
+                        rec["critFraction"] = round(raw / float(crit), 3)
+                    if hi:
+                        rec["maxC"] = round(hi / 1000.0, 1)
+                    (governed if crit else ambient).append(rec)
+
+                elif f.startswith("fan") and f.endswith("_input"):
+                    key = f[:-6]
+                    if (chip, key) in seen:
+                        continue
+                    rpm = read_int(os.path.join(d, f))
+                    if rpm is None:
+                        continue
+                    seen.add((chip, key))
+
+                    lo = read_int(os.path.join(d, key + "_min"))
+                    hi = read_int(os.path.join(d, key + "_max"))
+                    manual = read_int(os.path.join(d, key + "_manual"))
+                    rec = {
+                        "id": "%s/%s" % (prefix, key),
+                        "chip": chip,
+                        "label": (read(os.path.join(d, key + "_label")) or key).strip(),
+                        "rpm": rpm,
+                    }
+                    if instance:
+                        rec["instance"] = instance
+                    if lo is not None:
+                        rec["minRpm"] = lo
+                    if hi:
+                        rec["maxRpm"] = hi
+                    # 1 means something in userspace (mbpfan here) holds the
+                    # fan, rather than the firmware running its own curve.
+                    if manual is not None:
+                        rec["manual"] = bool(manual)
+                    if lo is not None and hi and hi > lo:
+                        rec["percent"] = round(max(0.0, (rpm - lo) / float(hi - lo)), 3)
+                    fans.append(rec)
+
+    return governed, ambient, fans
+
+
+def headline(governed, ambient):
+    """The two candidates for the top of the panel, because they disagree.
+
+    "Hottest" is the highest reading in the box, whatever published it. That is
+    the honest answer to "how hot is this machine", and on a fanless or
+    partly-ungoverned machine it is often an ambient sensor with no threshold.
+
+    "Closest to limit" is the governed sensor with the least headroom left, and
+    is the only comparison that means anything between chips with different
+    crit points. It is absent when nothing publishes a threshold.
+
+    These are not the same sensor. On one test laptop the CPU package reads
+    57 C against a 100 C crit while the SSD reads 51.9 C against 84.8 C, so the
+    SSD is closer to its limit while the CPU is plainly hotter. Reporting only
+    one of them hides the other, so the collector reports both and leaves the
+    choice of what to show to the panel.
+    """
+    out = {}
+
+    everything = governed + ambient
+    if everything:
+        top = max(everything, key=lambda r: r["celsius"])
+        out["hottest"] = {"label": top["label"], "chip": top["chip"],
+                          "celsius": top["celsius"],
+                          "class": "governed" if "critC" in top else "ambient"}
+        # Carried through so a panel comparing the two headlines can tell
+        # one drive's "Composite" from the other's; label and chip alone
+        # make two different sensors look like the same one.
+        if "instance" in top:
+            out["hottest"]["instance"] = top["instance"]
+
+    if governed:
+        top = max(governed, key=lambda r: r.get("critFraction", 0))
+        out["closestToLimit"] = {"label": top["label"], "chip": top["chip"],
+                                 "celsius": top["celsius"],
+                                 "critC": top.get("critC"),
+                                 "headroomC": top.get("headroomC"),
+                                 "critFraction": top.get("critFraction")}
+        if "instance" in top:
+            out["closestToLimit"]["instance"] = top["instance"]
+
+    return out or None
+
+
+def collect_cpu():
+    cpu = {"threads": os.cpu_count()}
+
+    model = None
+    for line in (read("/proc/cpuinfo") or "").splitlines():
+        if line.startswith("model name"):
+            model = line.split(":", 1)[1].strip()
+            break
+    if model:
+        cpu["model"] = model
+
+    loadavg = (read("/proc/loadavg") or "").split()
+    if len(loadavg) >= 3:
+        cpu["loadavg"] = [float(x) for x in loadavg[:3]]
+
+    gov = read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+    if gov:
+        cpu["governor"] = gov
+
+    # Raw jiffies per cpu; the consumer deltas these into utilisation.
+    stat = []
+    for line in (read("/proc/stat") or "").splitlines():
+        if line.startswith("cpu"):
+            parts = line.split()
+            if parts[0] == "cpu":
+                cpu["totalJiffies"] = [int(x) for x in parts[1:]]
+            else:
+                stat.append({"cpu": parts[0], "jiffies": [int(x) for x in parts[1:]]})
+    if stat:
+        cpu["perCoreJiffies"] = stat
+
+    freqs = []
+    for i in range(cpu["threads"] or 0):
+        khz = read_int("/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq" % i)
+        if khz:
+            freqs.append(round(khz / 1000.0))
+    if freqs:
+        cpu["freqMhz"] = freqs
+
+    return cpu
+
+
+def collect_memory():
+    info = {}
+    for line in (read("/proc/meminfo") or "").splitlines():
+        k, _, v = line.partition(":")
+        info[k] = int(v.split()[0]) if v.split() else 0
+
+    mem = {
+        "totalKb": info.get("MemTotal", 0),
+        "availableKb": info.get("MemAvailable", 0),
+        "swapTotalKb": info.get("SwapTotal", 0),
+        "swapFreeKb": info.get("SwapFree", 0),
+    }
+
+    # zram is swap that costs CPU rather than disk, so it is worth showing
+    # separately from a real swap partition.
+    zram = []
+    for entry in sorted(os.listdir("/sys/block")) if os.path.isdir("/sys/block") else []:
+        if not entry.startswith("zram"):
+            continue
+        total = read_int("/sys/block/%s/disksize" % entry)
+        used = read_int("/sys/block/%s/mm_stat" % entry)
+        rec = {"name": entry, "disksizeBytes": total or 0}
+        stat = (read("/sys/block/%s/mm_stat" % entry) or "").split()
+        if len(stat) >= 3:
+            rec["origDataBytes"] = int(stat[0])
+            rec["comprDataBytes"] = int(stat[1])
+            rec["memUsedBytes"] = int(stat[2])
+        zram.append(rec)
+    if zram:
+        mem["zram"] = zram
+
+    return mem
+
+
+def collect_net():
+    out = []
+    base = "/sys/class/net"
+    for iface in sorted(os.listdir(base)) if os.path.isdir(base) else []:
+        path = os.path.join(base, iface)
+        # Skip loopback and anything without a real device behind it (bridges,
+        # veth, docker) -- they are noise in a system panel.
+        if iface == "lo" or not os.path.exists(os.path.join(path, "device")):
+            continue
+        rec = {
+            "iface": iface,
+            "operstate": read(os.path.join(path, "operstate")) or "unknown",
+            "rxBytes": read_int(os.path.join(path, "statistics/rx_bytes")) or 0,
+            "txBytes": read_int(os.path.join(path, "statistics/tx_bytes")) or 0,
+        }
+        speed = read_int(os.path.join(path, "speed"))
+        if speed and speed > 0:
+            rec["linkSpeedMbps"] = speed
+        rec["wireless"] = os.path.isdir(os.path.join(path, "wireless"))
+        out.append(rec)
+    return out
+
+
+def collect_power():
+    base = "/sys/class/power_supply"
+    power = {}
+    batteries = []
+    for entry in sorted(os.listdir(base)) if os.path.isdir(base) else []:
+        p = os.path.join(base, entry)
+        kind = read(os.path.join(p, "type"))
+        if kind == "Mains":
+            online = read_int(os.path.join(p, "online"))
+            if online is not None:
+                power["onAc"] = bool(online)
+        elif kind == "Battery":
+            # Styluses, wireless keyboards and headsets register as batteries.
+            # They report scope=Device where a system battery reports nothing,
+            # and they arrive at 0% / Unknown, so a panel that shows every
+            # battery shows two dead ones next to the real charge.
+            if read(os.path.join(p, "scope")) == "Device":
+                continue
+            uv = read_int(os.path.join(p, "voltage_now"))
+            ua = read_int(os.path.join(p, "current_now"))
+            uw = read_int(os.path.join(p, "power_now"))
+            bat = {
+                "name": entry,
+                "percent": read_int(os.path.join(p, "capacity")),
+                "state": read(os.path.join(p, "status")),
+            }
+            if uv:
+                bat["volts"] = round(uv / 1e6, 3)
+            if ua:
+                bat["amps"] = round(ua / 1e6, 3)
+            # Some batteries report power directly; the rest need V*I. Either
+            # way the panel gets a watts figure without doing the arithmetic.
+            if uw:
+                bat["watts"] = round(uw / 1e6, 2)
+            elif uv and ua:
+                bat["watts"] = round((uv / 1e6) * (ua / 1e6), 2)
+            # The same reading is power leaving the battery when discharging
+            # and power entering it when charging. Label it, so the panel
+            # cannot present a charge rate as system draw.
+            if "watts" in bat:
+                bat["wattsDirection"] = {
+                    "Discharging": "draw",
+                    "Charging": "charge",
+                }.get(bat.get("state"), "unknown")
+            batteries.append(bat)
+    if batteries:
+        power["batteries"] = batteries
+    return power
+
+
+def disk_temp(p):
+    """A disk's own temperature, if its driver publishes one.
+
+    The hwmon directory sits either directly under the device (nvme gives
+    device/hwmon3) or inside a hwmon container (device/hwmon/hwmon3). Only the
+    container form was checked before, so NVMe temperatures were silently
+    missed on every machine.
+    """
+    for rel in ("device", "device/device"):
+        base = os.path.join(p, rel)
+        if not os.path.isdir(base):
+            continue
+        candidates = []
+        container = os.path.join(base, "hwmon")
+        if os.path.isdir(container):
+            candidates += [os.path.join(container, e) for e in sorted(os.listdir(container))]
+        try:
+            candidates += [os.path.join(base, e) for e in sorted(os.listdir(base))
+                           if e.startswith("hwmon")]
+        except OSError:
+            pass
+        for c in candidates:
+            t = read_int(os.path.join(c, "temp1_input"))
+            if t:
+                return round(t / 1000.0, 1)
+    return None
+
+
+def collect_disks():
+    out = []
+    base = "/sys/block"
+    for entry in sorted(os.listdir(base)) if os.path.isdir(base) else []:
+        # dm-* is a mapping of a disk already listed (LUKS, LVM), so it would
+        # double-count; the rest are not disks in any useful sense.
+        if entry.startswith(("zram", "loop", "ram", "sr", "dm-", "md")):
+            continue
+        p = os.path.join(base, entry)
+        sectors = read_int(os.path.join(p, "size"))
+        # A card reader with no card in it is still a block device, and reports
+        # zero sectors. Filtering on size rather than on another name prefix
+        # keeps the reader listed once it actually holds a card.
+        if not sectors:
+            continue
+        rec = {
+            "name": entry,
+            "sizeBytes": sectors * 512,
+            "rotational": bool(read_int(os.path.join(p, "queue/rotational"))),
+        }
+        # NVMe exposes a temperature through its own hwmon; SATA disks need
+        # smartctl, which is privileged, so they simply have no temperature.
+        temp = disk_temp(p)
+        if temp is not None:
+            rec["tempC"] = temp
+        out.append(rec)
+    return out
+
+
+def unescape_mount(s):
+    """mountinfo escapes space, tab, newline and backslash as octal."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), s)
+
+
+def mount_entries():
+    """Every mount, as (mountpoint, fstype, source), from mountinfo.
+
+    /proc/self/mountinfo rather than /proc/mounts because its fields are
+    unambiguous once the " - " separator is found, whatever the source path
+    contains.
+    """
+    out = []
+    for line in (read("/proc/self/mountinfo") or "").splitlines():
+        left, sep, right = line.partition(" - ")
+        if not sep:
+            continue
+        lf, rf = left.split(), right.split()
+        if len(lf) < 5 or len(rf) < 2:
+            continue
+        out.append({
+            "mountpoint": unescape_mount(lf[4]),
+            "fstype": rf[0],
+            "source": unescape_mount(rf[1]),
+        })
+    return out
+
+
+def block_name(rdev):
+    """The kernel's name for a block device number, or None."""
+    real = os.path.realpath("/sys/dev/block/%d:%d" % (os.major(rdev), os.minor(rdev)))
+    return os.path.basename(real) if os.path.isdir(real) else None
+
+
+def whole_disk(name, depth=0):
+    """The physical disk a block device ultimately sits on, or None.
+
+    Three cases, and only sysfs is consulted, so nothing here has to know how
+    a partition is spelled on NVMe versus SATA:
+
+      a partition  - has a `partition` file; the disk is its parent directory
+      a mapping    - dm-0 for LUKS or LVM, and md0 for RAID, hold the devices
+                     they are built from under `slaves/`, so follow the first
+                     one down. A LUKS volume on a partition is two hops.
+      a disk       - neither, so it is already the answer
+
+    Depth-limited because `slaves/` is a graph the kernel builds and this
+    walks it without having laid it out.
+    """
+    if not name or depth > 4:
+        return None
+    base = "/sys/class/block/" + name
+    if os.path.exists(os.path.join(base, "partition")):
+        return os.path.basename(os.path.dirname(os.path.realpath(base)))
+    slaves = os.path.join(base, "slaves")
+    if os.path.isdir(slaves):
+        members = sorted(os.listdir(slaves))
+        if members:
+            return whole_disk(members[0], depth + 1)
+    return name if os.path.isdir(base) else None
+
+
+def collect_filesystems():
+    """How full each real filesystem is.
+
+    A mount is included when its source stats as a block device. That is a
+    discovered property rather than a list of filesystem names, so btrfs,
+    ext4, xfs and f2fs all arrive without being named here, while tmpfs,
+    proc, cgroup, overlay and the rest of the pseudo filesystems do not --
+    none of them has a device behind it. Network mounts are excluded by the
+    same rule, which is just as well: statvfs on a dead NFS server blocks,
+    and this runs on a timer behind a bar panel.
+
+    Keyed on the block device rather than on the mountpoint, because one
+    filesystem is very often mounted several times. A btrfs root subvolume
+    layout puts /, /home, /var/log and /var/cache/pacman/pkg on one device,
+    and every one of them reports the same pool-wide free space; listing
+    four identical rows would say four times over what is true once. The
+    mountpoint kept is / where the device holds it, and the shortest path
+    otherwise. Bind mounts collapse under the same rule, while two genuinely
+    separate filesystems keep their own rows.
+
+    usedBytes and freeBytes do not add up to sizeBytes. free is what an
+    unprivileged process can actually write (f_bavail); the difference is
+    the reserved blocks, emitted as reservedBytes rather than quietly folded
+    into one side or the other.
+    """
+    by_device = {}
+    for m in mount_entries():
+        source = m["source"]
+        if not source.startswith("/"):
+            continue
+        try:
+            st = os.stat(source)
+            if not stat.S_ISBLK(st.st_mode):
+                continue
+            vfs = os.statvfs(m["mountpoint"])
+        except OSError:
+            continue
+        if not vfs.f_blocks:
+            continue
+
+        existing = by_device.get(st.st_rdev)
+        if existing and not preferred_mount(m["mountpoint"], existing["mountpoint"]):
+            continue
+
+        frsize = vfs.f_frsize or vfs.f_bsize
+        size = vfs.f_blocks * frsize
+        free = vfs.f_bavail * frsize
+        used = (vfs.f_blocks - vfs.f_bfree) * frsize
+
+        rec = {
+            "mountpoint": m["mountpoint"],
+            "fstype": m["fstype"],
+            "source": source,
+            "sizeBytes": size,
+            "usedBytes": used,
+            "freeBytes": free,
+            "reservedBytes": max(0, size - used - free),
+            "usedFraction": round(used / float(size), 4),
+            "freeFraction": round(free / float(size), 4),
+        }
+        device = block_name(st.st_rdev)
+        disk = whole_disk(device)
+        if device:
+            rec["device"] = device
+        # Which physical drive this is really on, so a panel can put a
+        # filesystem next to the temperature of the disk holding it. For a
+        # LUKS or LVM volume that is not the device the filesystem is
+        # mounted from.
+        if disk:
+            rec["disk"] = disk
+        # Inodes run out before bytes do on a filesystem full of small files,
+        # and that failure is invisible in a bytes figure. Reported only where
+        # the filesystem accounts for them; btrfs and xfs allocate them
+        # dynamically and report zero.
+        if vfs.f_files:
+            rec["inodesTotal"] = vfs.f_files
+            rec["inodesUsed"] = vfs.f_files - vfs.f_ffree
+            rec["inodesUsedFraction"] = round((vfs.f_files - vfs.f_ffree) / float(vfs.f_files), 4)
+        by_device[st.st_rdev] = rec
+
+    out = list(by_device.values())
+    # Root first, then biggest, so a panel showing only the first few rows
+    # shows the ones that matter.
+    out.sort(key=lambda r: (r["mountpoint"] != "/", -r["sizeBytes"], r["mountpoint"]))
+    return out
+
+
+def preferred_mount(candidate, current):
+    """Whether `candidate` is the better name for a filesystem mounted twice."""
+    if current == "/":
+        return False
+    if candidate == "/":
+        return True
+    return (len(candidate), candidate) < (len(current), current)
+
+
+def main():
+    governed, ambient, fans = collect_sensors()
+    record = {
+        "schemaVersion": 2,
+        "host": socket.gethostname(),
+        "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        # Monotonic, for deltas that survive a wall-clock change.
+        "monotonic": round(time.monotonic(), 3),
+        "thermal": dict({"governed": governed, "ambient": ambient},
+                        **(headline(governed, ambient) or {})),
+        "fans": fans,
+        "fanReporting": fan_reporting(fans),
+        "cpu": collect_cpu(),
+        "memory": collect_memory(),
+        "net": collect_net(),
+        "power": collect_power(),
+        "disks": collect_disks(),
+        "filesystems": collect_filesystems(),
+    }
+
+    indent = 2 if "--dump" in sys.argv else None
+    sep = (",", ": ") if indent else (",", ":")
+    print(json.dumps(record, indent=indent, separators=sep, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
