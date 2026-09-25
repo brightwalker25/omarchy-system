@@ -150,6 +150,22 @@ Targets laptops with very different sensors, so nothing is hardcoded:
   skipped. They report `scope=Device` and would otherwise show as extra
   batteries stuck at 0%.
 
+## Installing
+
+```bash
+omarchy plugin add https://github.com/brightwalker25/omarchy-system.git
+omarchy plugin enable brightwalker25.system --section right
+```
+
+It needs Python 3 and nothing else, and it installs nothing outside the plugin
+folder.
+
+## Removing
+
+```bash
+omarchy plugin remove brightwalker25.system
+```
+
 ## Usage
 
 ```bash
